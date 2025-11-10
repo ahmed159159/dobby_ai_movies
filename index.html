@@ -3,143 +3,474 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Dobby — Smart Movie Assistant</title>
+<title>Dobby — Smart AI Movie Assistant (IMDb + LLM)</title>
 <style>
-  body{margin:0;background:#000;color:#fff;font-family:Arial,system-ui;}
-  #app{max-width:900px;margin:0 auto;padding:20px}
-  #chat{border:1px solid #333;border-radius:10px;padding:10px;height:300px;overflow-y:auto;background:#111}
-  #results{margin-top:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
-  .movie{background:#1c1c1c;border-radius:8px;overflow:hidden}
-  .movie img{width:100%;height:240px;object-fit:cover}
-  .movie div{padding:8px;font-size:.9rem}
-  input,button{padding:10px;border-radius:8px;border:none}
-  #inputRow{display:flex;gap:8px;margin-top:12px}
-  button{background:#00ffc8;font-weight:bold;cursor:pointer}
+  :root { --c1:#00ffc3; --c2:#00b7ff; --fg:#f2f2f2; }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(circle at top,#0b0c10 0%,#000 100%);color:var(--fg);font-family:Inter,system-ui,Segoe UI,Arial}
+  #app{max-width:1100px;margin:0 auto;padding:16px}
+  header{display:flex;align-items:center;justify-content:space-between;margin:8px 0 12px}
+  h2{margin:0;color:var(--c1)}
+  #chat{border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:10px;height:240px;overflow-y:auto;background:rgba(255,255,255,.05)}
+  .msg{margin:6px 0;line-height:1.5}
+  .msg b{color:var(--c2)}
+  #row{display:grid;grid-template-columns:1fr auto auto;gap:8px;margin:10px 0}
+  input,button{border:none;border-radius:10px;padding:12px}
+  input{background:rgba(255,255,255,.1);color:#fff;outline:none}
+  button{background:linear-gradient(135deg,var(--c1),var(--c2));color:#000;font-weight:700;cursor:pointer}
+  #status{min-height:20px;font-style:italic;color:#cfe}
+  .spinner{width:12px;height:12px;border:2px solid var(--c1);border-top:2px solid transparent;border-radius:50%;display:inline-block;animation:spin .8s linear infinite;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #results{margin-top:12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+  .card{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);border-radius:12px;overflow:hidden}
+  .card img{width:100%;height:300px;object-fit:cover;background:#111}
+  .card .info{padding:10px}
+  .card .title{color:var(--c1);font-weight:700;margin-bottom:6px}
+  .muted{opacity:.85}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pill{background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);padding:6px 8px;border-radius:10px;cursor:pointer}
+  #history{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+  #prefsRow{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+  .like{cursor:pointer;margin-left:auto}
 </style>
 </head>
 <body>
 <div id="app">
+  <header>
+    <h2>Dobby — Smart AI Movie Assistant 🎬</h2>
+    <div class="row muted">
+      <span id="catCount">Catalog: 0</span>
+    </div>
+  </header>
 
-<h2>Dobby — Your AI Movie Assistant 🎬</h2>
+  <div id="history"></div>
 
-<div id="chat"></div>
+  <div id="chat"></div>
 
-<div id="inputRow">
-  <input id="userInput" placeholder="Ask e.g. 'best korean action 2018 8+'">
-  <button id="send">Ask</button>
-</div>
+  <div id="prefsRow" class="muted"></div>
 
-<div id="results"></div>
+  <div id="row">
+    <input id="q" placeholder="Ask: best Korean action after 2015 8+ / spy movies this year / Denzel Washington top 5">
+    <button id="send">Ask</button>
+    <button id="clear">Clear</button>
+  </div>
 
+  <div id="status"></div>
+
+  <div id="results"></div>
 </div>
 
 <script>
-// ====== CONFIG ======
-const FIREWORKS_KEY   = "fw_3ZGLzhbzx5RjAdU8mNQt4ZNb";       // ← استبدل لو حبيت
+// ===== CONFIG (your keys) =====
+const FIREWORKS_KEY   = "fw_3ZGLzhbzx5RjAdU8mNQt4ZNb";
 const FIREWORKS_MODEL = "accounts/fireworks/models/llama-v3p1-70b-instruct";
 const RAPID_KEY       = "09b4e8b9cbmsh354855aa8e8815dp1cf5dejsn5899f4db146f";
 const RAPID_HOST      = "imdb236.p.rapidapi.com";
 
-// ====== STATE ======
+// Where is catalog.json hosted?
+// If you put it in Vercel/GitHub root or public/, keep "/catalog.json"
+const CATALOG_URL = "/catalog.json";
+
+// ===== STATE =====
 let CATALOG = [];
 let RANK_CACHE = {};
+let CONTEXT = {}; // running filters across turns
+let PREFS = loadPrefs(); // user preferences memory
 
-// ====== UI ======
-function chat(role, text){
-  const box = document.getElementById("chat");
-  box.innerHTML += `<p><b>${role}:</b> ${text}</p>`;
+// ===== UI helpers =====
+const el = id => document.getElementById(id);
+const chat = (role, text) => {
+  const box = el("chat");
+  const div = document.createElement("div");
+  div.className = "msg";
+  div.innerHTML = `<b>${role}:</b> ${text}`;
+  box.appendChild(div);
   box.scrollTop = box.scrollHeight;
+};
+const setStatus = (msg, loading=false) => {
+  el("status").innerHTML = loading ? `<span class="spinner"></span>${msg}` : msg;
+};
+const addHistory = (text) => {
+  const h = el("history");
+  const p = document.createElement("div");
+  p.className = "pill";
+  p.textContent = text;
+  p.onclick = () => { el("q").value = text; ask(); };
+  h.prepend(p);
+};
+const updateCatCount = () => el("catCount").textContent = `Catalog: ${CATALOG.length}`;
+const showPrefs = () => {
+  const row = el("prefsRow");
+  row.innerHTML = "";
+  const keys = Object.keys(PREFS.likes||{});
+  if(!keys.length){ row.textContent = "Tip: click ♥ on a movie to teach your taste. Dobby will adapt."; return; }
+  row.textContent = "Your vibe: ";
+  keys.forEach(k=>{
+    const span = document.createElement("span");
+    span.className = "pill";
+    span.textContent = k;
+    row.appendChild(span);
+  });
+};
+
+// ===== SAFE JSON =====
+function safeParseJson(txt, fallback=null){
+  try {
+    let t = String(txt||"").trim();
+    if(t.startsWith("```")) t = t.split("```").slice(1).join("```");
+    // try block or array
+    const sBr = t.indexOf("{"), eBr = t.lastIndexOf("}");
+    const sAr = t.indexOf("["), eAr = t.lastIndexOf("]");
+    if(sAr!==-1 && eAr!==-1) return JSON.parse(t.substring(sAr, eAr+1));
+    if(sBr!==-1 && eBr!==-1) return JSON.parse(t.substring(sBr, eBr+1));
+    return JSON.parse(t);
+  } catch { return fallback; }
 }
-function showMovies(list){
-  const box = document.getElementById("results");
+
+// ===== PREFERENCES (localStorage) =====
+function loadPrefs(){
+  try { return JSON.parse(localStorage.getItem("dobby_prefs_v1")||"{}"); } catch { return {}; }
+}
+function savePrefs(){
+  localStorage.setItem("dobby_prefs_v1", JSON.stringify(PREFS));
+}
+function likeGenresOf(movie){
+  const gs = (movie.genres||movie.interests||[]).map(x=>String(x).toLowerCase());
+  PREFS.likes = PREFS.likes || {};
+  gs.forEach(g => { if(!g) return; PREFS.likes[g] = (PREFS.likes[g]||0)+1; });
+  savePrefs(); showPrefs();
+}
+
+// ===== LLM =====
+async function llm(messages){
+  // Retry on 429 with backoff
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+  let attempt = 0, lastErr = null;
+  while(attempt < 3){
+    try{
+      const r = await fetch("https://api.fireworks.ai/inference/v1/chat/completions",{
+        method:"POST",
+        headers:{ "Authorization":`Bearer ${FIREWORKS_KEY}`, "Content-Type":"application/json" },
+        body:JSON.stringify({ model: FIREWORKS_MODEL, messages, temperature:0.2, max_tokens:800 })
+      });
+      if(r.status === 429){ attempt++; await sleep(600*attempt); continue; }
+      if(!r.ok) throw new Error(`LLM ${r.status}`);
+      const data = await r.json();
+      return data?.choices?.[0]?.message?.content || "";
+    }catch(e){ lastErr=e; attempt++; await sleep(400*attempt); }
+  }
+  console.warn("LLM fallback:", lastErr?.message);
+  return ""; // allow heuristic fallback
+}
+
+// ===== ANALYZE (AI) =====
+async function analyze(q){
+  const content = await llm([
+    {role:"system",content:
+`You are Dobby, an English movie assistant.
+Extract intent to FILTER a movie set. Return ONLY JSON:
+
+{
+ "type": "movie"|"tv"|null,
+ "genre": string|null,
+ "language": string|null,
+ "country": string|null,
+ "year": number|null,
+ "year_after": number|null,
+ "year_before": number|null,
+ "min_rating": number|null,
+ "actor": string|null,
+ "director": string|null,
+ "top_n": number|null,
+ "theme": "spy|fbi|drug|heist|war|romance|comedy|sci-fi|horror|crime|drama|thriller|family|biopic|fantasy|sports"|null,
+ "summary": string
+}`},
+    {role:"user",content:q}
+  ]);
+  return safeParseJson(content, {summary:q});
+}
+
+// ===== FOLLOW-UP (AI) =====
+async function followup(filters){
+  const c = await llm([
+    {role:"system",content:"Ask ONE short question to refine results (year/rating/language/actor). Only the question."},
+    {role:"user",content:JSON.stringify(filters)}
+  ]);
+  const q = String(c||"").trim();
+  if(q && q.length < 140) chat("Dobby", q);
+}
+
+// ===== THEME LABEL (AI) =====
+async function labelTheme(title,overview){
+  const c = await llm([
+    {role:"system",content:"Label theme from title+overview with one of: spy,fbi,drug,heist,war,romance,comedy,sci-fi,horror,crime,drama,thriller,family,biopic,fantasy,sports. Return only the label."},
+    {role:"user",content:`Title: ${title}\nOverview: ${overview||""}`}
+  ]);
+  return String(c||"").trim().toLowerCase();
+}
+
+// ===== IMDb RapidAPI helpers =====
+async function imdbFetch(path){
+  const url = `https://${RAPID_HOST}${path}`;
+  const r = await fetch(url,{ headers:{ "X-Rapidapi-Key":RAPID_KEY, "X-Rapidapi-Host":RAPID_HOST }});
+  if(r.status === 429) throw new Error("RapidAPI 429");
+  if(!r.ok) throw new Error(`RapidAPI ${path} ${r.status}`);
+  return r.json();
+}
+async function imdbAutocomplete(q){ try { return await imdbFetch(`/api/imdb/autocomplete?query=${encodeURIComponent(q)}`); } catch { return []; } }
+async function imdbPersonTitles(pid,role){
+  const path = role==="director" ? `/api/imdb/director/${pid}/titles` : `/api/imdb/cast/${pid}/titles`;
+  try { return await imdbFetch(path); } catch { return []; }
+}
+async function imdbLists(){
+  const arr = await Promise.allSettled([
+    imdbFetch(`/api/imdb/top250-movies`),
+    imdbFetch(`/api/imdb/most-popular-movies`),
+    imdbFetch(`/api/imdb/top-box-office`)
+  ]);
+  return arr.flatMap(x=>x.status==="fulfilled"?x.value:[]);
+}
+async function imdbSearchGenre(g){
+  try { return await imdbFetch(`/api/imdb/search?type=movie&genre=${encodeURIComponent(g)}&rows=50&sortOrder=DESC&sortField=rating`); }
+  catch { return []; }
+}
+async function imdbRating(tt){ try { return await imdbFetch(`/api/imdb/${tt}/rating`); } catch { return null; } }
+async function imdbMeta(tt){ try { return await imdbFetch(`/api/imdb/${tt}/metascore`); } catch { return null; } }
+async function imdbPoster(tt){ try { return await imdbFetch(`/api/imdb/${tt}/poster`); } catch { return null; } }
+
+// ===== FILTERING =====
+function langCodeOrName(s){ if(!s) return null; const x = s.toLowerCase();
+  const map = { korean:"ko", english:"en", german:"de", japanese:"ja", chinese:"zh", french:"fr", spanish:"es", hindi:"hi", arabic:"ar" };
+  return map[x] || s;
+}
+function fits(item, f){
+  const year = item.startYear || Number(item.releaseDate?.slice(0,4)) || null;
+  const langs = (item.spokenLanguages||[]).map(x=>String(x).toLowerCase());
+  const countries = (item.countriesOfOrigin||[]).map(x=>String(x).toLowerCase());
+  const genres = (item.genres||[]).map(x=>String(x).toLowerCase());
+  const rating = item.averageRating || 0;
+
+  if(f.type==="movie" && (item.type||"").toLowerCase().includes("tv")) return false;
+  if(f.type==="tv"    && (item.type||"").toLowerCase().includes("movie")) return false;
+
+  if(f.genre && !genres.join(",").includes(String(f.genre).toLowerCase())) return false;
+  if(f.language){
+    const lc = langCodeOrName(f.language); if(lc && !langs.some(l=>l.includes(lc))) return false;
+  }
+  if(f.country){
+    if(!countries.some(c=>c.includes(String(f.country).toLowerCase()))) return false;
+  }
+  if(f.year && year && year !== Number(f.year)) return false;
+  if(f.year_after && year && year <= Number(f.year_after)) return false;
+  if(f.year_before && year && year >= Number(f.year_before)) return false;
+  if(f.min_rating && Number(rating) < Number(f.min_rating)) return false;
+
+  // bias toward user's liked genres
+  if(PREFS.likes){
+    const bonus = (item.genres||[]).reduce((s,g)=> s + (PREFS.likes[String(g).toLowerCase()]? 0.05 : 0), 0);
+    item._prefBoost = bonus;
+  }
+  return true;
+}
+
+// ===== FETCH CANDIDATES (Catalog → API fallback) =====
+async function candidates(f, query){
+  let pool = CATALOG.slice();
+
+  // Theme refine if user asked spy/fbi/drug/heist/war explicitly
+  if(/\b(spy|fbi|drug|drugs|cartel|heist|war)\b/i.test(query)){
+    const thematic = [];
+    for(const m of pool.slice(0,300)){
+      const lab = await labelTheme(m.primaryTitle||m.title||"", m.description||"");
+      if(lab && query.toLowerCase().includes(lab)) thematic.push(m);
+    }
+    if(thematic.length) pool = thematic;
+  }
+
+  // Person-focused
+  if(f.actor){
+    const ac = await imdbAutocomplete(f.actor);
+    const pid = (Array.isArray(ac)?ac:[]).find(x=>String(x.id).startsWith("nm"))?.id;
+    if(pid){ const items = await imdbPersonTitles(pid,"cast"); if(items?.length) pool = items; }
+  }
+  if(f.director){
+    const ac = await imdbAutocomplete(f.director);
+    const pid = (Array.isArray(ac)?ac:[]).find(x=>String(x.id).startsWith("nm"))?.id;
+    if(pid){ const items = await imdbPersonTitles(pid,"director"); if(items?.length) pool = items; }
+  }
+
+  // Local filter
+  let filtered = pool.filter(m=>fits(m,f));
+
+  // If nothing, genre fallback via API lists
+  if(!filtered.length){
+    if(f.genre){ filtered = await imdbSearchGenre(f.genre); }
+    if(!filtered.length){ filtered = await imdbLists(); }
+  }
+  return filtered;
+}
+
+// ===== RANK (AI + heuristic fallback) =====
+async function rank(list, query){
+  if(!list?.length) return [];
+  if(RANK_CACHE[query]) return RANK_CACHE[query];
+
+  const compact = list.slice(0,60).map(m=>({
+    id: m.id || m.url?.match(/tt\d+/)?.[0] || m.primaryTitle,
+    title: m.primaryTitle || m.title || m.originalTitle,
+    overview: m.description || "",
+    rating: m.averageRating || 0,
+    year: m.startYear || null,
+    genres: m.genres || m.interests || []
+  }));
+
+  let content = await llm([
+    {role:"system",content:'Return ONLY JSON array like [{"id":"tt123","score":92}]'},
+    {role:"user",content:`Rank by relevance for: "${query}"\nMovies: ${JSON.stringify(compact)}`}
+  ]);
+
+  let ranks = safeParseJson(content, []);
+  if(Array.isArray(ranks) && ranks.length){
+    const map = new Map(ranks.map(r=>[String(r.id), Number(r.score)||0]));
+    const ranked = list.map(m=>{
+      const id = m.id || m.url?.match(/tt\d+/)?.[0] || m.primaryTitle;
+      return {...m, _score: (map.get(String(id))||0) + (m._prefBoost||0)};
+    }).sort((a,b)=>b._score-a._score);
+    RANK_CACHE[query]=ranked;
+    return ranked;
+  }
+
+  // Heuristic fallback when LLM fails (e.g., 429)
+  const q = String(query).toLowerCase();
+  const tokens = q.split(/[^a-z0-9]+/i).filter(Boolean);
+  const want = {
+    spy:/\bspy|espionage|cia|mi6|agent\b/i.test(q),
+    fbi:/\bfbi\b/i.test(q),
+    drug:/\bdrug|cartel|narco\b/i.test(q),
+    heist:/\bheist|robbery|bank\b/i.test(q),
+    war:/\bwar|military|soldier\b/i.test(q),
+    action:/\baction\b/i.test(q)
+  };
+  const score = (m)=>{
+    const title=(m.primaryTitle||m.title||"").toLowerCase();
+    const ov=(m.description||"").toLowerCase();
+    const g=(m.genres||[]).map(x=>String(x).toLowerCase());
+    let s=(Number(m.averageRating)||0)*10 + (m._prefBoost||0);
+    for(const t of tokens){ if(title.includes(t)) s+=6; if(ov.includes(t)) s+=3; }
+    if(want.action && g.includes("action")) s+=10;
+    if(want.spy && (g.includes("thriller")||ov.includes("spy")||ov.includes("agent"))) s+=12;
+    if(want.heist && (g.includes("crime")||ov.includes("heist")||ov.includes("robbery"))) s+=12;
+    if(want.drug && (ov.includes("drug")||ov.includes("cartel")||g.includes("crime"))) s+=10;
+    if(want.fbi && (ov.includes("fbi")||ov.includes("f.b.i")||ov.includes("federal"))) s+=8;
+    if(want.war && (g.includes("war")||ov.includes("war")||ov.includes("soldier"))) s+=12;
+    if(/this year|after\s?20\d{2}/i.test(q)){ const y=Number(m.startYear||0); s += Math.max(0, (y-2015)); }
+    return s;
+  };
+  return list.map(m=>({...m,_score:score(m)})).sort((a,b)=>b._score-a._score);
+}
+
+// ===== ENRICH (ratings/poster) =====
+async function enrich(items){
+  const take = items.slice(0, 12);
+  const out = [];
+  for(const m of take){
+    const tt = String(m.id||m.url?.match(/tt\d+/)?.[0]||"").match(/tt\d+/)?.[0];
+    let avg = m.averageRating, meta = m.metascore, poster = m.primaryImage;
+    try{ if(tt && avg==null){ avg = (await imdbRating(tt))?.averageRating ?? avg; } }catch{}
+    try{ if(tt && meta==null){ meta = (await imdbMeta(tt))?.metascore ?? meta; } }catch{}
+    try{ if(tt && !poster){ poster = (await imdbPoster(tt))?.url ?? poster; } }catch{}
+    out.push({...m, averageRating:avg, metascore:meta, primaryImage:poster});
+  }
+  return out;
+}
+
+// ===== RENDER =====
+function imdbLink(it){ return it.url || (it.id ? `https://www.imdb.com/title/${it.id}/` : "#"); }
+function yearOf(it){ return it.startYear || String(it.releaseDate||"").slice(0,4) || ""; }
+function render(list){
+  const box = el("results");
   box.innerHTML = "";
-  list.slice(0,10).forEach(m=>{
-    box.innerHTML += `
-      <div class="movie">
-        <img src="${m.primaryImage||''}">
-        <div>${m.primaryTitle||m.title||''}<br>⭐ ${m.averageRating||"N/A"}</div>
+  list.forEach(m=>{
+    const d=document.createElement("div");
+    d.className="card";
+    d.innerHTML = `
+      ${m.primaryImage?`<img src="${m.primaryImage}" alt="${m.primaryTitle||m.title}">`:`<div style="height:300px;background:#111"></div>`}
+      <div class="info">
+        <div class="row">
+          <div class="title">${m.primaryTitle||m.title||"Untitled"}</div>
+          <div class="like" title="Like this">❤️</div>
+        </div>
+        <div class="muted">⭐ ${m.averageRating!=null?m.averageRating:"N/A"}${m.metascore!=null?` | Metascore ${m.metascore}`:""} | ${yearOf(m)}</div>
+        <div class="muted" style="margin-top:6px">${m.description?String(m.description).slice(0,120)+"…":""}</div>
+        <div class="row" style="margin-top:8px">
+          <a href="${imdbLink(m)}" target="_blank" rel="noopener" class="pill">IMDb</a>
+        </div>
       </div>
     `;
+    d.querySelector(".like").onclick = ()=> likeGenresOf(m);
+    box.appendChild(d);
   });
 }
 
-// ====== LOAD CATALOG ======
-(async ()=>{
-  const res = await fetch("/catalog.json");
-  CATALOG = await res.json();
-  chat("Dobby","✅ Catalog loaded ("+CATALOG.length+" movies). Ask me anything!");
-})();
-
-// ====== LLM ======
-async function llm(messages){
-  const r = await fetch("https://api.fireworks.ai/inference/v1/chat/completions",{
-    method:"POST",
-    headers:{
-      "Authorization":`Bearer ${FIREWORKS_KEY}`,
-      "Content-Type":"application/json"
-    },
-    body:JSON.stringify({model:FIREWORKS_MODEL,messages,temperature:0.2})
-  });
-  return (await r.json()).choices[0].message.content;
-}
-
-// ====== AI ANALYSIS ======
-async function analyze(q){
-return JSON.parse(
-  (await llm([
-    {role:"system",content:`Return only JSON: { genre, language, year_after, min_rating, theme, summary }`},
-    {role:"user",content:q}
-  ]))
-  .replace(/```/g,"")
-);
-}
-
-// ====== AI RANK ======
-async function rank(list, query){
-  if(RANK_CACHE[query]) return RANK_CACHE[query];
-  const compact=list.slice(0,60).map(m=>({id:m.id,title:m.primaryTitle,overview:m.description||""}));
-  let scored = await llm([
-    {role:"system",content:`Return ONLY JSON ranking: [{"id":"tt123","score":90}]`},
-    {role:"user",content:`Rank relevance for: "${query}"\nMovies: ${JSON.stringify(compact)}`}
-  ]);
-  scored = JSON.parse(scored.replace(/```/g,""));
-  const map=new Map(scored.map(s=>[s.id,s.score]));
-  const ranked = list.map(m=>({...m,_score:map.get(m.id)||0})).sort((a,b)=>b._score-a._score);
-  RANK_CACHE[query]=ranked;
-  return ranked;
-}
-
-// ====== SEARCH ======
-function filter(list,f){
-  return list.filter(m=>{
-    if(f.genre && !(m.genres||[]).join().toLowerCase().includes(f.genre.toLowerCase())) return false;
-    if(f.language && !(m.spokenLanguages||[]).join().toLowerCase().includes(f.language.toLowerCase())) return false;
-    if(f.year_after && (m.startYear||0) < f.year_after) return false;
-    if(f.min_rating && (m.averageRating||0) < f.min_rating) return false;
-    return true;
-  });
-}
-
-// ====== MAIN ======
+// ===== MAIN ASK =====
 async function ask(){
-  const q=document.getElementById("userInput").value.trim();
+  const q = el("q").value.trim();
   if(!q) return;
-  chat("You",q);
+  el("q").value = "";
+  addHistory(q);
+  chat("You", q);
 
-  const f = await analyze(q);
-  chat("Dobby","🔍 "+f.summary);
+  // Merge new analysis into CONTEXT (makes conversation sticky)
+  setStatus("Understanding…", true);
+  let parsed = await analyze(q);
+  if(parsed && typeof parsed === "object"){ Object.entries(parsed).forEach(([k,v])=>{ if(v!==null&&v!==""&&v!==undefined) CONTEXT[k]=v; }); }
+  chat("Dobby", "🔍 " + (parsed?.summary || q));
 
-  let pool = filter(CATALOG,f);
-  if(pool.length===0){ chat("Dobby","🚫 No results"); return; }
+  // Fetch → Rank → Enrich
+  setStatus("Searching…", true);
+  let items = await candidates(CONTEXT, q);
 
-  let ranked = await rank(pool,q);
+  setStatus("Ranking…", true);
+  items = await rank(items, q);
 
-  showMovies(ranked);
-  chat("Dobby","✅ Done ("+ranked.length+" found).");
+  setStatus("Enriching…", true);
+  const enriched = await enrich(items);
+
+  setStatus("");
+  if(!enriched.length){ chat("Dobby","🚫 No results found. Try changing year/language/rating/actor."); return; }
+  render(enriched.slice(0, CONTEXT.top_n || 10));
+  chat("Dobby", `✅ Done. Found ${Math.min(enriched.length, CONTEXT.top_n||10)} results.`);
+
+  // Proactive follow-up
+  followup(CONTEXT);
 }
 
-document.getElementById("send").onclick = ask;
-document.getElementById("userInput").onkeydown = (e)=>{if(e.key==="Enter")ask()};
+// ===== BOOT =====
+async function boot(){
+  chat("Dobby","Hi! I’m Dobby — your AI movie assistant. Ask away ✨");
+  try{
+    const r = await fetch(CATALOG_URL);
+    if(!r.ok) throw new Error("catalog fetch failed");
+    CATALOG = await r.json();
+    updateCatCount();
+    showPrefs();
+    chat("Dobby", `📚 Catalog ready (${CATALOG.length}). I learn from your likes ♥`);
+  }catch(e){
+    chat("Dobby", "⚠️ Could not load catalog.json. Put it beside index.html or in /public.");
+  }
+}
+boot();
+
+// ===== EVENTS =====
+el("send").onclick = ask;
+el("clear").onclick = ()=>{
+  el("chat").innerHTML="";
+  el("results").innerHTML="";
+  RANK_CACHE={};
+  CONTEXT={};
+  chat("Dobby","Hi! I’m Dobby — your AI movie assistant. Ask away ✨");
+};
+el("q").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); ask(); } });
 </script>
 </body>
 </html>
